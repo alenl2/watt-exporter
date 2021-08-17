@@ -1,10 +1,12 @@
-var express = require("express");
-var cookieParser = require("cookie-parser");
-var logger = require("morgan");
+const express = require("express");
+const cookieParser = require("cookie-parser");
+const logger = require("morgan");
 
 const apiMetrics = require("prometheus-api-metrics");
-var mqtt = require('mqtt')
-const prom = require('prom-client');
+const axios = require("axios");
+const SolarEdgeModbusClient = require("solaredge-modbus-client");
+const mqtt = require("mqtt");
+const { universalParseValue, allMetrics } = require("./universalMetricParser");
 
 var app = express();
 app.use(apiMetrics());
@@ -14,85 +16,142 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 
+var client2 = mqtt.connect(process.env.MQTT_ADDRESS, {
+  username: process.env.MQTT_USERNAME, //TODO better
+  password: process.env.MQTT_PASSWORD,
+});
+/*
+let solar = new SolarEdgeModbusClient({
+  host: process.env.SOLAREDGE_ADDRESS,
+  port: 502,
+});
+*/
+client2.on("connect", function () {
+  console.log("Mqtt2 connected");
+  client2.subscribe("current/#", function (err) {
+    if (err) {
+      process.exit(1);
+    }
+  });
+});
 
-function isNumeric(str) {
-  if (typeof str != "string") return false
-  return !isNaN(str) && !isNaN(parseFloat(str)) 
+(async () => {
+  while (true) {
+    await monitorMainWattmetter();
+    await monitorEvse();
+    //await monitorSolarEdge();
+    setEvseChargingCurrent();
+  }
+})();
+
+client2.on("message", function (topic, message) {
+  console.log("Got mqtt message "+message.toString() + " on topic "+ topic);
+  var splitTopic = topic.split("/");
+  var deviceId = splitTopic[1];
+  var valueRaw = message.toString();
+  var metricName = deviceId + "_" + splitTopic[0];
+
+  universalParseValue(valueRaw, metricName, deviceId);
+});
+
+function monitorMainWattmetter() {
+  return new Promise((res, rej) => {
+    setTimeout(() => {
+      axios
+        .get(process.env.WATT_ADDRESS+"/updateData")
+        .then(function (response) {
+          delete response.data.WATTMETER_TIME;
+          console.log("Got wattmetter message "+JSON.stringify(response.data));
+          for (const property in response.data) {
+            var deviceId = "watt01";
+            var metricName = deviceId + "_" + property;
+            var valueRaw = response.data[property];
+            universalParseValue(valueRaw, metricName, deviceId);
+          }
+        })
+        .catch(function (error) {
+          console.log(error);
+        })
+        .then(function () {
+          res();
+        });
+    }, 2000);
+  });
 }
 
+var lastSetCurrent = 0;
 
-var mqtt = require('mqtt')
-var client  = mqtt.connect(process.env.MQTT_ADDRESS, {
-  username: process.env.MQTT_USERNAME,//TODO better
-  password: process.env.MQTT_PASSWORD 
-})
- 
-client.on('connect', function () {
-  client.subscribe('ovms/#', function (err) {
-    if(err){
-      process.exit(1)
-    }
-  })
-})
-
-var metricsDict = {}
-
-client.on('message', function (topic, message) {
-  // message is Buffer
-  //console.log(topic +" -> "+ message);
-
-  var splitTopic = topic.split("/");
-  var deviceId = splitTopic[2];
-  var metricName = splitTopic.slice(4,splitTopic.length).join("_");
-  var valueRaw = message.toString();
-
-  if(splitTopic[0]!=="ovms" || deviceId === "" || deviceId === undefined || metricName === "" || metricName === undefined){
-    console.log({device: deviceId, metric: metricName, topicRaw: topic, valueRaw: valueRaw})
-    return;
-  }
-
-
-  //console.log("Got metric "+ metricName);
-
-  var value = Number(valueRaw);
-  if(valueRaw === "yes"){
-    value = 1;
-  }
-  if(valueRaw === "no"){
-    value = 0;
-  }
-
-  var valueListRaw = valueRaw.split(",");
-  var valueList = [];
-  for(val of valueListRaw){
-    if(isNumeric(val)){
-      valueList.push(Number(val))
-    }else{
-      valueList = [];
-      break;
-    }
-  }
-  if(valueList.length == 0){
-    valueList = [value]
+function setEvseChargingCurrent() {
+  var chargingCurrent = allMetrics["evse01_amp_0"] / 1000;
+  var maxFuse = 25;
+  var phasePower = [allMetrics["watt01_I1_0"] / 100.0 - chargingCurrent, allMetrics["watt01_I2_0"] / 100.0 - chargingCurrent, allMetrics["watt01_I3_0"] / 100.0 - chargingCurrent];//TODO include solar data
+  var highestCurrent = maxFuse - Math.round(Math.max(...phasePower)); //subtract current now
+  if (highestCurrent < 0) {
+    highestCurrent = 0;
   }
   
-  if(metricsDict[metricName] === undefined){
-    const gauge = new prom.Gauge({ name: metricName, help: 'No Help!', labelNames: ['valueRaw', 'device', 'metricIndex'],});
-    metricsDict[metricName] = gauge
+  if(Math.abs(lastSetCurrent - highestCurrent) > 1){
+    axios
+    .get(process.env.OEVSE_ADDRESS+"/r?json=1&rapi=$SC+" + highestCurrent)
+    .then(function (response) {
+      lastSetCurrent = highestCurrent
+      console.log("Max charing current set to "+highestCurrent+"A per phase")
+      console.log(response.data);
+    })
+    .catch(function (error) {
+      console.log(error); //raise error
+    })
   }
+    
+  universalParseValue(lastSetCurrent, "set_max_charge_current", "wattCalc01");
 
-  for(var i=0;i<valueList.length;i++){
-      var rawV = valueRaw
-      if(isNaN(valueList[i]) == false){
-        rawV = "null"//no need since its already in there
-      }
-      gauge = metricsDict[metricName]
-      gauge.set({ valueRaw: rawV, device: deviceId, metricIndex: i}, valueList[i]); 
-  
-      //console.log({device: deviceId, metric: metricName, value: value, valueRaw: valueRaw})
-  }
+}
 
-})
+function monitorEvse() {
+  return new Promise((res, rej) => {
+    setTimeout(() => {
+      axios
+        .get(process.env.OEVSE_ADDRESS+"/status")
+        .then(function (response) {
+          delete response.data.time;
+          console.log("Got ovms message"+JSON.stringify(response.data));
+          for (const property in response.data) {
+            var deviceId = "evse01";
+            var metricName = deviceId + "_" + property;
+            var valueRaw = response.data[property];
+
+            universalParseValue(valueRaw, metricName, deviceId);
+          }
+        })
+        .catch(function (error) {
+          console.log(error);
+        })
+        .then(function () {
+          res();
+        });
+    }, 2000);
+  });
+}
+
+function  monitorSolarEdge(){
+  return new Promise((res, rej) => {
+    setTimeout(() => {
+      solar
+        .getData()
+        .then((data) => {
+          console.log(data); //todo export dis
+          var deviceId = "solar01";
+          var metricName = deviceId + "_" + property;
+          var valueRaw = response.data[property];
+
+          universalParseValue(valueRaw, metricName, deviceId);
+        })
+        .catch(function (error) {
+          console.log(error);
+        });
+    }, 5000);
+  });
+}
 
 console.log("App running on port 3000");
 module.exports = app;
