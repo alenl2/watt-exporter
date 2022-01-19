@@ -1,4 +1,4 @@
-FROM node:16-alpine3.12
+FROM node:latest
 
 ARG BUILD_VERSION=0.0.0
 
